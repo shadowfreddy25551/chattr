@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# chattr2 - (v3) simple secure chat using openssl s_server and s_client
-# This version fixes a critical race condition where named pipes were used
-# before being created, leading to connection failures.
+# chattr2 - (v4) simple secure chat using openssl s_server and s_client
+# This version fixes a critical process management bug where the server's
+# subshell would exit prematurely, terminating the openssl connection.
 
 DEFAULT_PORT=12345
 LIVE_PORT=12346 # Port for the /live command
@@ -31,7 +31,7 @@ fi
 
 function show_help() {
     cat <<EOF
-chattr2 (v3) - Secure chat with file transfer and remote command execution.
+chattr2 (v4) - Secure chat with file transfer and remote command execution.
 
 Usage:
   chattr2 server [port]
@@ -65,7 +65,6 @@ function generate_cert() {
 }
 
 # --- Cleanup ---
-# A dynamic temp directory is now created by the server/client modes.
 TMP_DIR=""
 function cleanup() {
     pkill -P $$ &>/dev/null
@@ -80,21 +79,16 @@ trap cleanup EXIT INT TERM
 # --- Core Chat Logic ---
 function start_chat() {
     local peer_name=$1
-    local is_server=$2
-    local openssl_pid=$3
-    local PIPE_IN=$4
-    local PIPE_OUT=$5
+    local openssl_pid=$2
+    local PIPE_IN=$3
+    local PIPE_OUT=$4
 
     tput civis # Hide cursor
 
-    # Receiver subshell: Reads from PIPE_OUT and displays messages
+    # Receiver subshell
     (
-        local in_file_transfer=false
-        local transfer_path=""
-        local pending_req_file=""
-
         while read -r line; do
-            echo -ne "\r\033[K" # Clear line, print message, redraw prompt
+            echo -ne "\r\033[K"
             local prefix="${line%%:*}"; local data="${line#*:}"
 
             case "$prefix" in
@@ -102,44 +96,42 @@ function start_chat() {
                     local src_b64="${data%%:*}"; local dest_b64="${data#*:}"
                     local src_file; src_file=$(echo "$src_b64" | base64 -d)
                     local dest_file; dest_file=$(echo "$dest_b64" | base64 -d)
-                    dest_file="${dest_file/#\~/$HOME}" # Expand peer's home dir
-                    pending_req_file=$(mktemp "$TMP_DIR/req.XXXXXX")
-                    echo "REQ_COPY:$src_b64:$(echo -n "$dest_file" | base64 -w0)" > "$pending_req_file"
+                    dest_file="${dest_file/#\~/$HOME}"
+                    local pending_req_file=$(mktemp "$TMP_DIR/req.XXXXXX")
+                    echo "REQ_COPY:$(echo -n "$dest_file" | base64 -w0)" > "$pending_req_file"
                     echo "--> Incoming file request: '$src_file' to '$dest_file'. Allow? (yes/no)"
                     ;;
                 REQ_EXEC)
                     local cmd_b64="$data"; local cmd; cmd=$(echo "$cmd_b64" | base64 -d)
-                    pending_req_file=$(mktemp "$TMP_DIR/req.XXXXXX")
+                    local pending_req_file=$(mktemp "$TMP_DIR/req.XXXXXX")
                     echo "REQ_EXEC:$cmd_b64" > "$pending_req_file"
                     echo "--> Incoming exec request: '$cmd'. Allow? (yes/no)"
                     ;;
                 REQ_LIVE)
                     local cmd_b64="${data%%:*}"; local peer_ip="${data#*:}"
                     local cmd; cmd=$(echo "$cmd_b64" | base64 -d)
-                    pending_req_file=$(mktemp "$TMP_DIR/req.XXXXXX")
+                    local pending_req_file=$(mktemp "$TMP_DIR/req.XXXXXX")
                     echo "REQ_LIVE:$cmd_b64:$peer_ip" > "$pending_req_file"
-                    echo "--> Incoming interactive session request for: '$cmd'. Allow? (yes/no)"
+                    echo "--> Incoming interactive session for: '$cmd'. Allow? (yes/no)"
                     ;;
                 RESP_LIVE_OK)
-                    echo "--> Peer accepted. Starting interactive session... (Exit command to return)"
+                    echo "--> Peer accepted. Starting interactive session..."
                     tput cnorm
                     socat "TCP:$data:$LIVE_PORT" "READLINE,history=$LOCAL_HOME/.chattr2_history"
                     tput civis
-                    echo "--> Interactive session ended. You are back in chat."
+                    echo "--> Interactive session ended."
                     ;;
                 RESP_OK) echo "--> Peer accepted the request." ;;
                 RESP_NO) echo "--> Peer denied the request." ;;
-                CMD_ERR)
-                    local err_msg; err_msg=$(echo "$data" | base64 -d)
-                    echo -e "--> Remote command failed:\n---\n$err_msg\n---"
-                    ;;
-                FILE_DATA) if [[ "$in_file_transfer" == true ]]; then echo "$data" | base64 -d >> "$transfer_path"; fi ;;
+                CMD_ERR) echo -e "--> Remote command failed:\n---\n$(echo "$data" | base64 -d)\n---" ;;
+                FILE_DATA) if [[ -f "$TMP_DIR/transfer" ]]; then local transfer_path; transfer_path=$(cat "$TMP_DIR/transfer"); echo "$data" | base64 -d >> "$transfer_path"; fi ;;
                 FILE_BEGIN)
-                    in_file_transfer=true; transfer_path="$data";
+                    local transfer_path="$data"
+                    echo "$transfer_path" > "$TMP_DIR/transfer"
                     echo "--> Receiving file to '$transfer_path'..."
                     mkdir -p "$(dirname "$transfer_path")" && >"$transfer_path"
                     ;;
-                FILE_END) in_file_transfer=false; echo "--> File transfer to '$transfer_path' complete."; transfer_path="" ;;
+                FILE_END) rm -f "$TMP_DIR/transfer"; echo "--> File transfer complete." ;;
                 CMD_OUT) echo "[Remote]: $data" ;;
                 INFO) echo "[$peer_name Info]: $data" ;;
                 *) echo "[$peer_name]: $line" ;;
@@ -148,10 +140,10 @@ function start_chat() {
         done < "$PIPE_OUT"
         
         echo -e "\r\033[K--> $peer_name disconnected."
-        kill $$ # Exit cleanly
+        kill $$
     ) &
 
-    # Sender loop: Reads user input and writes to PIPE_IN
+    # Sender loop
     exec 3>"$PIPE_IN"
     while READLINE_LINE="" read -r -e -p "You: " msg; do
         local pending_req_file; pending_req_file=$(find "$TMP_DIR" -name "req.??????")
@@ -163,17 +155,12 @@ function start_chat() {
             if [[ "$msg" =~ ^[yY]([eE][sS])?$ ]]; then
                 echo "RESP_OK" >&3
                 if [[ "$req_prefix" == "REQ_COPY" ]]; then
-                    local dest_file; dest_file=$(echo "${req_data#*:}" | base64 -d)
-                    echo "FILE_BEGIN:$dest_file" >&3
+                    echo "FILE_BEGIN:$req_data" >&3
                 elif [[ "$req_prefix" == "REQ_EXEC" ]]; then
                     local cmd_to_run; cmd_to_run=$(echo "$req_data" | base64 -d)
                     echo "INFO:Executing '$cmd_to_run'..." >&3
                     local output; output=$(bash -c "$cmd_to_run" 2>&1); local status=$?
-                    if [[ $status -ne 0 ]]; then
-                        echo "CMD_ERR:$(echo -n "$output" | base64 -w 0)" >&3
-                    else
-                        while IFS= read -r output_line; do echo "CMD_OUT:$output_line" >&3; done <<< "$output"
-                    fi
+                    [[ $status -ne 0 ]] && echo "CMD_ERR:$(echo -n "$output" | base64 -w 0)" >&3 || while IFS= read -r l; do echo "CMD_OUT:$l" >&3; done <<< "$output"
                 elif [[ "$req_prefix" == "REQ_LIVE" ]]; then
                     local cmd_b64="${req_data%%:*}"; local peer_ip="${req_data#*:}"
                     local cmd_to_run; cmd_to_run=$(echo "$cmd_b64" | base64 -d)
@@ -182,7 +169,7 @@ function start_chat() {
                     tput cnorm
                     $SUDO_CMD socat "TCP-LISTEN:$LIVE_PORT,reuseaddr,fork" "EXEC:'$cmd_to_run',pty,stderr,setsid,sigint,sane"
                     tput civis
-                    echo "--> Peer's interactive session ended."
+                    echo "--> Peer's session ended."
                 fi
             else
                 echo "RESP_NO" >&3; echo "--> Denied request."
@@ -194,33 +181,27 @@ function start_chat() {
             read -r -a cmd_parts <<< "$msg"
             case "${cmd_parts[0]}" in
                 "/copy")
-                    local local_file="${cmd_parts[1]}"; local remote_file="${cmd_parts[2]}"
+                    local local_file="${cmd_parts[1]}"; local remote_file="${cmd_parts[2]:-$(basename -- "${cmd_parts[1]}")}"
                     if [[ ! -f "$local_file" ]]; then echo "Error: File '$local_file' not found."; continue; fi
-                    if [[ -z "$remote_file" ]]; then remote_file=$(basename -- "$local_file"); fi
                     echo "REQ_COPY:$(echo -n "$local_file" | base64 -w0):$(echo -n "$remote_file" | base64 -w0)" >&3
-                    echo "--> Requesting to send '$local_file'. Waiting..."
                     ( while read -r line; do
                         if [[ "${line%%:*}" == "RESP_OK" ]]; then
                             echo "INFO:Sending file..." >&3
                             base64 -w 0 "$local_file" | while IFS= read -r -n 4096 chunk; do echo "FILE_DATA:$chunk" >&3; done
-                            echo "FILE_END" >&3
-                            break
+                            echo "FILE_END" >&3; break
                         elif [[ "${line%%:*}" == "RESP_NO" ]]; then break; fi
                       done < "$PIPE_OUT" ) &
                     ;;
                 "/exec")
-                    local cmd_to_req="${msg#*/exec }"; if [[ -z "$cmd_to_req" ]]; then echo "Usage: /exec <command...>"; continue; fi
-                    echo "REQ_EXEC:$(echo -n "$cmd_to_req" | base64 -w0)" >&3
-                    echo "--> Requesting to execute on peer. Waiting..."
+                    local cmd_to_req="${msg#*/exec }"; [[ -z "$cmd_to_req" ]] && echo "Usage: /exec <command...>" || echo "REQ_EXEC:$(echo -n "$cmd_to_req" | base64 -w0)" >&3
                     ;;
                 "/live")
-                    local cmd_to_req="${msg#*/live }"; if [[ -z "$cmd_to_req" ]]; then echo "Usage: /live <command...>"; continue; fi
+                    local cmd_to_req="${msg#*/live }"; [[ -z "$cmd_to_req" ]] && echo "Usage: /live <command...>" && continue
                     local local_ip; local_ip=$(ss -tnp | grep "$openssl_pid" | grep 'ESTAB' | awk '{print $4}' | head -n1 | cut -d: -f1)
                     if [[ -z "$local_ip" ]]; then echo "Error: Could not determine local IP."; continue; fi
                     echo "REQ_LIVE:$(echo -n "$cmd_to_req" | base64 -w0):$local_ip" >&3
-                    echo "--> Requesting interactive session. Waiting..."
                     ;;
-                "/help") show_help; ;;
+                "/help") show_help ;;
                 *) echo "Unknown command: ${cmd_parts[0]}." ;;
             esac
         elif [[ "$msg" == "exit" ]]; then
@@ -238,28 +219,32 @@ function server_mode() {
     local cert_file; cert_file=$(generate_cert)
 
     while true; do
-        # For each new session, create a unique directory and the pipes within it.
         TMP_DIR=$(mktemp -d "/tmp/chattr2.server.$$.XXXXXX")
-        local PIPE_IN="$TMP_DIR/in"
-        local PIPE_OUT="$TMP_DIR/out"
-        mkfifo "$PIPE_IN" "$PIPE_OUT" # <-- FIX: Create pipes BEFORE they are used.
+        local PIPE_IN="$TMP_DIR/in"; local PIPE_OUT="$TMP_DIR/out"
+        mkfifo "$PIPE_IN" "$PIPE_OUT"
 
         echo "Starting chattr2 server on port $PORT... (Ctrl+C to stop)"
+        
+        # This subshell now correctly manages a single client session.
         (
             $SUDO_CMD openssl s_server -n -N -brief -accept "$PORT" -cert "$cert_file" -quiet < "$PIPE_IN" > "$PIPE_OUT" 2>/dev/null &
             local openssl_pid=$!
             
             echo "Waiting for a client to connect..."
             until ss -tnp | grep -q "$openssl_pid.*ESTAB"; do
-                if ! ps -p $openssl_pid > /dev/null; then exit; fi
-                sleep 0.5
+                if ! ps -p $openssl_pid > /dev/null; then exit; fi; sleep 0.5
             done
             
             echo "Client connected. (Type /help or 'exit')"
-            start_chat "Client" "true" "$openssl_pid" "$PIPE_IN" "$PIPE_OUT"
+            # FIX: This function now runs in the foreground of the subshell.
+            # The subshell will NOT exit until start_chat returns.
+            start_chat "Client" "$openssl_pid" "$PIPE_IN" "$PIPE_OUT"
+
+            # After start_chat finishes, kill the session's openssl process and wait for it.
+            kill "$openssl_pid" 2>/dev/null
+            wait "$openssl_pid" 2>/dev/null
         )
         
-        # Cleanup the temp dir for the session that just ended.
         rm -rf "$TMP_DIR"
         echo "Session ended. Server is ready for a new connection."
         sleep 1
@@ -270,11 +255,9 @@ function client_mode() {
     local server_ip=$1; local port_arg=$2
     if [[ -n $port_arg && $port_arg =~ ^[0-9]+$ ]]; then PORT=$port_arg; fi
 
-    # Create a unique directory and pipes for the client session.
     TMP_DIR=$(mktemp -d "/tmp/chattr2.client.$$.XXXXXX")
-    local PIPE_IN="$TMP_DIR/in"
-    local PIPE_OUT="$TMP_DIR/out"
-    mkfifo "$PIPE_IN" "$PIPE_OUT" # <-- FIX: Create pipes BEFORE they are used.
+    local PIPE_IN="$TMP_DIR/in"; local PIPE_OUT="$TMP_DIR/out"
+    mkfifo "$PIPE_IN" "$PIPE_OUT"
 
     echo "Connecting to $server_ip:$PORT ..."
     openssl s_client -connect "$server_ip:$PORT" -quiet < "$PIPE_IN" > "$PIPE_OUT" 2>/dev/null &
@@ -286,7 +269,13 @@ function client_mode() {
     fi
 
     echo "Connected. (Type /help or 'exit')"
-    start_chat "Server" "false" "$openssl_pid" "$PIPE_IN" "$PIPE_OUT"
+    # FIX: start_chat is now the main foreground process.
+    # The script will wait here until the user types 'exit'.
+    start_chat "Server" "$openssl_pid" "$PIPE_IN" "$PIPE_OUT"
+
+    # After start_chat returns, clean up.
+    kill "$openssl_pid" 2>/dev/null
+    wait "$openssl_pid" 2>/dev/null
 }
 
 # --- Main Execution Logic ---
