@@ -47,18 +47,19 @@ EOF
 }
 
 function generate_cert() {
-    # Generate cert in /tmp to avoid permission issues in the current directory
+    # Generate cert in /tmp to avoid permission issues and clutter
     local cert_path="/tmp/chattr2_server.pem"
     if [[ ! -f "$cert_path" ]]; then
-        echo "Generating self-signed cert in $cert_path..."
+        # THIS IS THE FIX: Status messages go to stderr (>&2)
+        echo "Generating self-signed cert in $cert_path..." >&2
         local key_path="/tmp/chattr2_key.pem"
-        # Hide openssl output
+        # Hide openssl command output
         openssl req -newkey rsa:2048 -nodes -keyout "$key_path" -x509 -days 365 -out "$cert_path" \
             -subj "/CN=chattr2-server" &>/dev/null
         cat "$key_path" >> "$cert_path"
         rm "$key_path"
     fi
-    # Return the path to the cert
+    # This is the ONLY thing sent to stdout, so it's all that gets captured
     echo "$cert_path"
 }
 
@@ -67,6 +68,8 @@ function cleanup() {
     # The >/dev/null check suppresses "kill: no such process" errors
     if [[ -n "$COPROC_PID" ]]; then kill "$COPROC_PID" &>/dev/null; fi
     if [[ -n "$receiver_pid" ]]; then kill "$receiver_pid" &>/dev/null; fi
+    # Restore cursor visibility on exit
+    tput cnorm
     echo -e "\nConnection closed. Exiting."
 }
 
@@ -80,17 +83,21 @@ function server_mode() {
     fi
 
     local cert_file
+    # This now correctly captures ONLY the path
     cert_file=$(generate_cert)
+    
     echo "Starting chattr2 server on port $PORT..."
     echo "Waiting for a client to connect..."
 
     # Create a coprocess for the OpenSSL server
-    coproc { openssl s_server -accept "$PORT" -cert "$cert_file" -quiet; }
+    coproc COPROC_SERVER { openssl s_server -accept "$PORT" -cert "$cert_file" -quiet; }
 
     echo "Client connected. You can start chatting. (Press Ctrl+D or type 'exit' to end)"
+    # Hide cursor while typing for cleaner look
+    tput civis
 
     # Receiver loop (runs in the background to listen for messages)
-    (while read -r -u "${COPROC[0]}" line; do
+    (while read -r -u "${COPROC_SERVER[0]}" line; do
         # \r\033[K clears the current terminal line before printing the message
         echo -e "\r\033[KClient: $line"
         echo -n "You: "
@@ -99,9 +106,9 @@ function server_mode() {
 
     # Sender loop (runs in the foreground to send messages)
     echo -n "You: "
-    while read -r msg; do
+    while read -r -e msg; do
         if [[ "$msg" == "exit" ]]; then break; fi
-        echo "$msg" >&"${COPROC[1]}"
+        echo "$msg" >&"${COPROC_SERVER[1]}"
         echo -n "You: "
     done
 }
@@ -116,18 +123,21 @@ function client_mode() {
 
     echo "Connecting to $server_ip:$PORT ..."
     # Create a coprocess for the OpenSSL client
-    coproc { openssl s_client -connect "$server_ip:$PORT" -quiet -crlf 2>/dev/null; }
+    coproc COPROC_CLIENT { openssl s_client -connect "$server_ip:$PORT" -quiet -crlf 2>/dev/null; }
 
     # Check if the coprocess started successfully (i.e., connection was made)
-    if ! ps -p $COPROC_PID > /dev/null; then
+    # A small sleep gives the process a moment to fail if it's going to
+    sleep 0.2
+    if ! ps -p $COPROC_CLIENT_PID > /dev/null; then
        echo "Connection failed. Is the server running at that IP/port?" >&2
        exit 1
     fi
 
     echo "Connected. You can start chatting. (Press Ctrl+D or type 'exit' to end)"
+    tput civis
 
     # Receiver loop (runs in the background)
-    (while read -r -u "${COPROC[0]}" line; do
+    (while read -r -u "${COPROC_CLIENT[0]}" line; do
         echo -e "\r\033[KServer: $line"
         echo -n "You: "
     done) &
@@ -135,9 +145,9 @@ function client_mode() {
 
     # Sender loop (runs in the foreground)
     echo -n "You: "
-    while read -r msg; do
+    while read -r -e msg; do
         if [[ "$msg" == "exit" ]]; then break; fi
-        echo "$msg" >&"${COPROC[1]}"
+        echo "$msg" >&"${COPROC_CLIENT[1]}"
         echo -n "You: "
     done
 }
