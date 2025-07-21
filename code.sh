@@ -1,22 +1,22 @@
 #!/bin/bash
 
-# chattr - simple secure chat using openssl s_server and s_client
+# chattr2 - simple secure chat using openssl s_server and s_client
 # Usage:
-#   chattr server [port]
-#   chattr client <server_ip> [port]
-#   chattr --help
+#   chattr2 server [port]
+#   chattr2 client <server_ip> [port]
+#   chattr2 --help
 
 DEFAULT_PORT=12345
 PORT=$DEFAULT_PORT
 
 function show_help() {
     cat <<EOF
-chattr - Simple secure chat between two PCs
+chattr2 - Simple secure chat between two PCs
 
 Usage:
-  chattr server [port]              Start chat server on [port] (default: $DEFAULT_PORT)
-  chattr client <server_ip> [port] Connect to server at <server_ip> on [port] (default: $DEFAULT_PORT)
-  chattr --help                    Show this help message and exit
+  chattr2 server [port]              Start chat server on [port] (default: $DEFAULT_PORT)
+  chattr2 client <server_ip> [port] Connect to server at <server_ip> on [port] (default: $DEFAULT_PORT)
+  chattr2 --help                    Show this help message and exit
 EOF
 }
 
@@ -24,7 +24,7 @@ function generate_cert() {
     if [[ ! -f server.pem ]]; then
         echo "Generating self-signed cert (server.pem)..."
         openssl req -newkey rsa:2048 -nodes -keyout key.pem -x509 -days 365 -out server.pem \
-            -subj "/CN=chattr-server"
+            -subj "/CN=chattr2-server"
         cat key.pem >> server.pem
         rm key.pem
     fi
@@ -38,7 +38,7 @@ function server_mode() {
     fi
 
     generate_cert
-    echo "Starting chattr server on port $PORT..."
+    echo "Starting chattr2 server on port $PORT..."
     openssl s_server -accept "$PORT" -cert server.pem -quiet | while read -r line; do
         echo "Client: $line"
         echo -n "You: "
