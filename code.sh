@@ -2,14 +2,17 @@
 
 DEFAULT_PORT=12345
 
-for cmd in openssl ss; do
+# Added 'socat' to the list of required dependencies
+for cmd in openssl ss socat; do
     if ! command -v "$cmd" &> /dev/null; then
-        echo "Error: Core dependency '$cmd' not installed. Please install." >&2
+        echo "Error: Core dependency '$cmd' not installed. Please install it." >&2
+        echo "e.g., sudo apt-get install socat" >&2
         exit 1
     fi
 done
 
 SUDO_CMD=""
+# Logic to handle sudo and home directory remains the same
 if [[ "$EUID" -eq 0 ]]; then
     SUDO_CMD="sudo"
     if [[ -n "$SUDO_USER" ]]; then
@@ -43,18 +46,20 @@ function generate_cert() {
     mkdir -p "$cert_dir"
     local cert_path="$cert_dir/chattr2_server.pem"
     if [[ ! -f "$cert_path" ]]; then
+        echo "Generating self-signed certificate..."
         openssl req -newkey rsa:2048 -nodes -keyout "$cert_path" -x509 -days 365 -out "$cert_path" -subj "/CN=chattr2.local" &>/dev/null
     fi
     echo "$cert_path"
 }
 
 TMP_DIR=""
-OPENSSL_PID=""
+NET_PID="" # Renamed from OPENSSL_PID
 RECEIVER_PID=""
 
 function cleanup() {
     tput cnorm
-    [[ -n $OPENSSL_PID ]] && kill "$OPENSSL_PID" 2>/dev/null
+    # Kill the network process (now socat) and the receiver
+    [[ -n $NET_PID ]] && kill "$NET_PID" 2>/dev/null
     [[ -n $RECEIVER_PID ]] && kill "$RECEIVER_PID" 2>/dev/null
     [[ -n $TMP_DIR && -d $TMP_DIR ]] && rm -rf "$TMP_DIR"
     echo -e "\nExiting."
@@ -63,13 +68,14 @@ trap cleanup EXIT INT TERM
 
 function start_chat() {
     local peer_name=$1
-    local openssl_pid=$2
-    local PIPE_IN=$3
-    local PIPE_OUT=$4
+    local net_pid=$2
+    # Use clearer pipe names passed from the parent function
+    local PIPE_TO_NET=$3
+    local PIPE_FROM_NET=$4
 
     tput civis
 
-    # Receiver reads peer messages and prints them async
+    # Receiver reads messages from the network via PIPE_FROM_NET
     (
         while read -r line; do
             echo -ne "\r\033[K"
@@ -95,11 +101,12 @@ function start_chat() {
                     ;;
             esac
             echo -n "You: "
-        done < "$PIPE_OUT"
+        done < "$PIPE_FROM_NET"
     ) &
     RECEIVER_PID=$!
 
-    exec 3>"$PIPE_IN"
+    # Open PIPE_TO_NET on file descriptor 3. This is crucial as it keeps the pipe open.
+    exec 3>"$PIPE_TO_NET"
 
     while true; do
         read -e -p "You: " msg || break
@@ -119,11 +126,11 @@ function start_chat() {
             break
         fi
 
-        # Send plain messages directly
+        # Send plain messages directly to the network pipe
         echo "$msg" >&3
     done
 
-    exec 3>&-
+    exec 3>&- # Close the file descriptor
     kill "$RECEIVER_PID" 2>/dev/null
     wait "$RECEIVER_PID" 2>/dev/null
     tput cnorm
@@ -138,19 +145,23 @@ function server_mode() {
 
     while true; do
         TMP_DIR=$(mktemp -d "/tmp/chattr2.server.$$.XXXXXX")
-        local PIPE_IN="$TMP_DIR/in"
-        local PIPE_OUT="$TMP_DIR/out"
-        mkfifo "$PIPE_IN" "$PIPE_OUT"
+        # Clearer pipe names
+        local PIPE_FROM_NET="$TMP_DIR/from_net"
+        local PIPE_TO_NET="$TMP_DIR/to_net"
+        mkfifo "$PIPE_FROM_NET" "$PIPE_TO_NET"
 
-        echo "Starting server on port $PORT... (Ctrl+C to stop)"
+        echo "Starting server on port $PORT using socat... (Ctrl+C to stop)"
 
-        $SUDO_CMD openssl s_server -accept "$PORT" -cert "$cert_file" -quiet <"$PIPE_IN" >"$PIPE_OUT" 2>/dev/null &
-        OPENSSL_PID=$!
+        # Use socat for a robust, bidirectional SSL server.
+        # It reads from PIPE_TO_NET and writes to PIPE_FROM_NET.
+        $SUDO_CMD socat OPENSSL-LISTEN:"$PORT",cert="$cert_file",key="$cert_file",verify=0,fork,reuseaddr \
+            < "$PIPE_TO_NET" > "$PIPE_FROM_NET" 2>/dev/null &
+        NET_PID=$!
 
         echo "Waiting for client..."
-        until ss -tnp | grep -q "$OPENSSL_PID.*ESTAB"; do
-            if ! ps -p $OPENSSL_PID > /dev/null; then
-                echo "OpenSSL server process exited."
+        until ss -tnp | grep -q "$NET_PID.*ESTAB"; do
+            if ! ps -p $NET_PID > /dev/null; then
+                echo "Socat server process exited unexpectedly. Is port $PORT in use?" >&2
                 break 2
             fi
             sleep 0.5
@@ -158,10 +169,10 @@ function server_mode() {
 
         echo "Client connected. Type /help or exit."
 
-        start_chat "Client" "$OPENSSL_PID" "$PIPE_IN" "$PIPE_OUT"
+        start_chat "Client" "$NET_PID" "$PIPE_TO_NET" "$PIPE_FROM_NET"
 
-        kill "$OPENSSL_PID" 2>/dev/null
-        wait "$OPENSSL_PID" 2>/dev/null
+        kill "$NET_PID" 2>/dev/null
+        wait "$NET_PID" 2>/dev/null
         rm -rf "$TMP_DIR"
         echo "Session ended. Waiting for new connection."
         sleep 1
@@ -174,28 +185,35 @@ function client_mode() {
     PORT=${port_arg:-$DEFAULT_PORT}
 
     TMP_DIR=$(mktemp -d "/tmp/chattr2.client.$$.XXXXXX")
-    local PIPE_IN="$TMP_DIR/in"
-    local PIPE_OUT="$TMP_DIR/out"
-    mkfifo "$PIPE_IN" "$PIPE_OUT"
+    local PIPE_FROM_NET="$TMP_DIR/from_net"
+    local PIPE_TO_NET="$TMP_DIR/to_net"
+    mkfifo "$PIPE_FROM_NET" "$PIPE_TO_NET"
 
-    echo "Connecting to $server_ip:$PORT ..."
-    openssl s_client -connect "$server_ip:$PORT" -quiet <"$PIPE_IN" >"$PIPE_OUT" 2>/dev/null &
-    OPENSSL_PID=$!
+    echo "Connecting to $server_ip:$PORT using socat..."
 
-    sleep 0.5
-    if ! ps -p "$OPENSSL_PID" > /dev/null; then
+    # Use socat for a robust client connection.
+    # It reads from PIPE_TO_NET and writes to PIPE_FROM_NET.
+    socat OPENSSL-CONNECT:"$server_ip:$PORT",verify=0 \
+        < "$PIPE_TO_NET" > "$PIPE_FROM_NET" 2>/dev/null &
+    NET_PID=$!
+
+    # Allow time for connection to establish or fail
+    sleep 1
+    if ! ps -p "$NET_PID" > /dev/null; then
         echo "Connection failed. Is the server running at $server_ip:$PORT?" >&2
+        rm -rf "$TMP_DIR"
         exit 1
     fi
 
     echo "Connected. Type /help or exit."
-    start_chat "Server" "$OPENSSL_PID" "$PIPE_IN" "$PIPE_OUT"
+    start_chat "Server" "$NET_PID" "$PIPE_TO_NET" "$PIPE_FROM_NET"
 
-    kill "$OPENSSL_PID" 2>/dev/null
-    wait "$OPENSSL_PID" 2>/dev/null
+    kill "$NET_PID" 2>/dev/null
+    wait "$NET_PID" 2>/dev/null
     rm -rf "$TMP_DIR"
 }
 
+# Main script logic remains the same
 case "$1" in
     server) server_mode "${@:2}" ;;
     client)
