@@ -2,48 +2,107 @@
 
 # chattr2 - simple secure chat using openssl s_server and s_client
 # Usage:
-#   chattr2 server [port]
-#   chattr2 client <server_ip> [port]
+#   chattr2 server [port] [--nosudo]
+#   chattr2 client <server_ip> [port] [--nosudo]
 #   chattr2 --help
 
 DEFAULT_PORT=12345
 PORT=$DEFAULT_PORT
+
+# --- Sudo Check ---
+# Check for --nosudo flag
+nosudo_flag=false
+new_args=()
+for arg in "$@"; do
+    if [[ "$arg" == "--nosudo" ]]; then
+        nosudo_flag=true
+    else
+        new_args+=("$arg")
+    fi
+done
+
+# If --nosudo was found, update the script's arguments to remove it
+if [[ "$nosudo_flag" == true ]]; then
+    set -- "${new_args[@]}"
+# If --nosudo was not found, check for root privileges
+elif [[ "$EUID" -ne 0 ]]; then
+    echo "Error: This script must be run with root privileges." >&2
+    echo "Please use 'sudo chattr2 ...' or add the '--nosudo' flag to run without root." >&2
+    exit 1
+fi
+# --- End Sudo Check ---
+
 
 function show_help() {
     cat <<EOF
 chattr2 - Simple secure chat between two PCs
 
 Usage:
-  chattr2 server [port]              Start chat server on [port] (default: $DEFAULT_PORT)
-  chattr2 client <server_ip> [port] Connect to server at <server_ip> on [port] (default: $DEFAULT_PORT)
-  chattr2 --help                    Show this help message and exit
+  chattr2 server [port] [--nosudo]     Start chat server on [port] (default: $DEFAULT_PORT)
+  chattr2 client <ip> [port] [--nosudo] Connect to server at <ip> on [port] (default: $DEFAULT_PORT)
+  chattr2 --help                       Show this help message and exit
+
+The --nosudo flag allows running without root privileges.
 EOF
 }
 
 function generate_cert() {
-    if [[ ! -f server.pem ]]; then
-        echo "Generating self-signed cert (server.pem)..."
-        openssl req -newkey rsa:2048 -nodes -keyout key.pem -x509 -days 365 -out server.pem \
-            -subj "/CN=chattr2-server"
-        cat key.pem >> server.pem
-        rm key.pem
+    # Generate cert in /tmp to avoid permission issues in the current directory
+    local cert_path="/tmp/chattr2_server.pem"
+    if [[ ! -f "$cert_path" ]]; then
+        echo "Generating self-signed cert in $cert_path..."
+        local key_path="/tmp/chattr2_key.pem"
+        # Hide openssl output
+        openssl req -newkey rsa:2048 -nodes -keyout "$key_path" -x509 -days 365 -out "$cert_path" \
+            -subj "/CN=chattr2-server" &>/dev/null
+        cat "$key_path" >> "$cert_path"
+        rm "$key_path"
     fi
+    # Return the path to the cert
+    echo "$cert_path"
 }
 
+# This function cleans up background processes on exit
+function cleanup() {
+    # The >/dev/null check suppresses "kill: no such process" errors
+    if [[ -n "$COPROC_PID" ]]; then kill "$COPROC_PID" &>/dev/null; fi
+    if [[ -n "$receiver_pid" ]]; then kill "$receiver_pid" &>/dev/null; fi
+    echo -e "\nConnection closed. Exiting."
+}
+
+# Set a trap to call the cleanup function on script exit (e.g., Ctrl+C)
+trap cleanup EXIT
+
 function server_mode() {
-    # Use second argument as port or default
-    local port_arg=$2
+    local port_arg=$1
     if [[ -n $port_arg && $port_arg =~ ^[0-9]+$ ]]; then
         PORT=$port_arg
     fi
 
-    generate_cert
+    local cert_file
+    cert_file=$(generate_cert)
     echo "Starting chattr2 server on port $PORT..."
-    openssl s_server -accept "$PORT" -cert server.pem -quiet | while read -r line; do
-        echo "Client: $line"
+    echo "Waiting for a client to connect..."
+
+    # Create a coprocess for the OpenSSL server
+    coproc { openssl s_server -accept "$PORT" -cert "$cert_file" -quiet; }
+
+    echo "Client connected. You can start chatting. (Press Ctrl+D or type 'exit' to end)"
+
+    # Receiver loop (runs in the background to listen for messages)
+    (while read -r -u "${COPROC[0]}" line; do
+        # \r\033[K clears the current terminal line before printing the message
+        echo -e "\r\033[KClient: $line"
         echo -n "You: "
-        read -r msg
-        echo "$msg"
+    done) &
+    receiver_pid=$!
+
+    # Sender loop (runs in the foreground to send messages)
+    echo -n "You: "
+    while read -r msg; do
+        if [[ "$msg" == "exit" ]]; then break; fi
+        echo "$msg" >&"${COPROC[1]}"
+        echo -n "You: "
     done
 }
 
@@ -56,21 +115,41 @@ function client_mode() {
     fi
 
     echo "Connecting to $server_ip:$PORT ..."
-    openssl s_client -connect "$server_ip:$PORT" -quiet 2>/dev/null | while read -r line; do
-        echo "Server: $line"
+    # Create a coprocess for the OpenSSL client
+    coproc { openssl s_client -connect "$server_ip:$PORT" -quiet -crlf 2>/dev/null; }
+
+    # Check if the coprocess started successfully (i.e., connection was made)
+    if ! ps -p $COPROC_PID > /dev/null; then
+       echo "Connection failed. Is the server running at that IP/port?" >&2
+       exit 1
+    fi
+
+    echo "Connected. You can start chatting. (Press Ctrl+D or type 'exit' to end)"
+
+    # Receiver loop (runs in the background)
+    (while read -r -u "${COPROC[0]}" line; do
+        echo -e "\r\033[KServer: $line"
         echo -n "You: "
-        read -r msg
-        echo "$msg"
+    done) &
+    receiver_pid=$!
+
+    # Sender loop (runs in the foreground)
+    echo -n "You: "
+    while read -r msg; do
+        if [[ "$msg" == "exit" ]]; then break; fi
+        echo "$msg" >&"${COPROC[1]}"
+        echo -n "You: "
     done
 }
 
+# --- Argument Parsing ---
 case "$1" in
     server)
-        server_mode "$@"
+        server_mode "${@:2}"
         ;;
     client)
         if [[ -z "$2" ]]; then
-            echo "Error: Missing server IP."
+            echo "Error: Missing server IP address." >&2
             show_help
             exit 1
         fi
@@ -79,8 +158,10 @@ case "$1" in
     --help|-h)
         show_help
         ;;
-    *)
-        echo "Invalid or missing command."
+    ""|*) # Handle empty input and invalid commands
+        if [[ -n "$1" ]]; then
+             echo "Error: Invalid command '$1'." >&2
+        fi
         show_help
         exit 1
         ;;
