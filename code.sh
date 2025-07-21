@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # chattr2 - simple secure chat using openssl s_server and s_client
-# This version uses robust named pipes (mkfifo) for IPC instead of coproc.
+# This version uses robust named pipes and the -reuse flag for the server.
 
 DEFAULT_PORT=12345
 PORT=$DEFAULT_PORT
@@ -58,10 +58,8 @@ PIPE_OUT="/tmp/chattr2_out_$$"
 
 # This global cleanup function is called when the script is force-closed (Ctrl+C)
 function cleanup() {
-    # Kill any running background processes by their PID
     if [[ -n "$openssl_pid" ]]; then kill "$openssl_pid" &>/dev/null; fi
     if [[ -n "$receiver_pid" ]]; then kill "$receiver_pid" &>/dev/null; fi
-    # Remove the named pipes
     rm -f "$PIPE_IN" "$PIPE_OUT"
     tput cnorm # Ensure cursor is visible
     echo -e "\nExiting."
@@ -76,44 +74,37 @@ function server_mode() {
     local cert_file
     cert_file=$(generate_cert)
 
-    # Main server loop to allow reconnects
     while true; do
-        # Create the named pipes for this session
         mkfifo "$PIPE_IN" "$PIPE_OUT"
 
         echo "Starting chattr2 server on port $PORT..."
         echo "Waiting for a client to connect... (Ctrl+C to stop server)"
 
-        # Start OpenSSL server in the background.
-        # It reads from PIPE_IN and writes to PIPE_OUT.
-        # The <"$PIPE_IN" is crucial; it blocks until the 'cat' on the other end starts.
-        openssl s_server -accept "$PORT" -cert "$cert_file" -quiet < "$PIPE_IN" > "$PIPE_OUT" &
+        # **FIX 1**: Added the '-reuse' flag to prevent "Address already in use" errors.
+        openssl s_server -accept "$PORT" -cert "$cert_file" -quiet -reuse < "$PIPE_IN" > "$PIPE_OUT" &
         openssl_pid=$!
 
         echo "Client connected. You can start chatting. (Type 'exit' or Ctrl+D to disconnect)"
         tput civis # Hide cursor
 
-        # Receiver: Read from PIPE_OUT and display messages from the client
-        (cat "$PIPE_OUT" | while read -r line; do
+        # **FIX 2**: Read directly from the pipe to prevent buffering issues.
+        (while read -r line; do
             echo -e "\r\033[KClient: $line"
             echo -n "You: "
-        done; echo -e "\nClient disconnected. Waiting for new connection...") &
+        done < "$PIPE_OUT"; echo -e "\nClient disconnected. Waiting for new connection...") &
         receiver_pid=$!
 
-        # Sender: Read user input and write it to PIPE_IN
         echo -n "You: "
         while read -r -e msg; do
             if [[ "$msg" == "exit" ]]; then break; fi
-            # Check if the openssl process is still alive before writing
             if ! ps -p $openssl_pid > /dev/null; then break; fi
             echo "$msg" > "$PIPE_IN"
             echo -n "You: "
         done
 
-        # Client disconnected, kill the processes for this session and clean up pipes
         kill "$openssl_pid" "$receiver_pid" &>/dev/null
         rm -f "$PIPE_IN" "$PIPE_OUT"
-        tput cnorm # Restore cursor
+        tput cnorm
     done
 }
 
@@ -124,12 +115,10 @@ function client_mode() {
         PORT=$port_arg
     fi
 
-    # Create pipes for the client
     mkfifo "$PIPE_IN" "$PIPE_OUT"
 
     echo "Connecting to $server_ip:$PORT ..."
-    # Start OpenSSL client in the background
-    openssl s_client -connect "$server_ip:$PORT" -quiet -crlf < "$PIPE_IN" > "$PIPE_OUT" 2>/dev/null &
+    openssl s_client -connect "$server_ip:$PORT" -quiet < "$PIPE_IN" > "$PIPE_OUT" 2>/dev/null &
     openssl_pid=$!
 
     sleep 0.5
@@ -141,14 +130,13 @@ function client_mode() {
     echo "Connected. You can start chatting. (Type 'exit' or Ctrl+D to disconnect)"
     tput civis
 
-    # Receiver: Read from PIPE_OUT and display messages from the server
-    (cat "$PIPE_OUT" | while read -r line; do
+    # **FIX 2**: Read directly from the pipe to prevent buffering issues.
+    (while read -r line; do
         echo -e "\r\033[KServer: $line"
         echo -n "You: "
-    done; echo -e "\nServer disconnected.") &
+    done < "$PIPE_OUT"; echo -e "\nServer disconnected.") &
     receiver_pid=$!
 
-    # Sender: Read user input and write it to PIPE_IN
     echo -n "You: "
     while read -r -e msg; do
         if [[ "$msg" == "exit" ]]; then break; fi
@@ -156,8 +144,6 @@ function client_mode() {
         echo "$msg" > "$PIPE_IN"
         echo -n "You: "
     done
-    
-    # Exiting, cleanup is handled by the main trap
 }
 
 # --- Argument Parsing ---
