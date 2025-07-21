@@ -1,10 +1,7 @@
 #!/bin/bash
 
 # chattr2 - simple secure chat using openssl s_server and s_client
-# Usage:
-#   chattr2 server [port] [--nosudo]
-#   chattr2 client <server_ip> [port] [--nosudo]
-#   chattr2 --help
+# This version uses robust named pipes (mkfifo) for IPC instead of coproc.
 
 DEFAULT_PORT=12345
 PORT=$DEFAULT_PORT
@@ -55,11 +52,17 @@ function generate_cert() {
     echo "$cert_path"
 }
 
+# Define pipe paths using the script's Process ID ($$) to ensure they are unique
+PIPE_IN="/tmp/chattr2_in_$$"
+PIPE_OUT="/tmp/chattr2_out_$$"
+
 # This global cleanup function is called when the script is force-closed (Ctrl+C)
 function cleanup() {
-    # Kill any running background processes
-    if [[ -n "$coproc_pid" ]]; then kill "$coproc_pid" &>/dev/null; fi
+    # Kill any running background processes by their PID
+    if [[ -n "$openssl_pid" ]]; then kill "$openssl_pid" &>/dev/null; fi
     if [[ -n "$receiver_pid" ]]; then kill "$receiver_pid" &>/dev/null; fi
+    # Remove the named pipes
+    rm -f "$PIPE_IN" "$PIPE_OUT"
     tput cnorm # Ensure cursor is visible
     echo -e "\nExiting."
 }
@@ -70,51 +73,46 @@ function server_mode() {
     if [[ -n $port_arg && $port_arg =~ ^[0-9]+$ ]]; then
         PORT=$port_arg
     fi
-
     local cert_file
     cert_file=$(generate_cert)
 
-    # This is the main server loop. It allows the server to accept new clients after one disconnects.
+    # Main server loop to allow reconnects
     while true; do
+        # Create the named pipes for this session
+        mkfifo "$PIPE_IN" "$PIPE_OUT"
+
         echo "Starting chattr2 server on port $PORT..."
         echo "Waiting for a client to connect... (Ctrl+C to stop server)"
 
-        # Start OpenSSL server in a coprocess. It will wait here until a client connects.
-        coproc COPROC_SERVER { openssl s_server -accept "$PORT" -cert "$cert_file" -quiet; }
-        coproc_pid=$COPROC_SERVER_PID
-
-        # Give the process a moment to start and fail if the port is busy
-        sleep 0.2
-        if ! ps -p $coproc_pid > /dev/null; then
-           echo "Error: Server failed to start. Is port $PORT already in use?" >&2
-           exit 1
-        fi
+        # Start OpenSSL server in the background.
+        # It reads from PIPE_IN and writes to PIPE_OUT.
+        # The <"$PIPE_IN" is crucial; it blocks until the 'cat' on the other end starts.
+        openssl s_server -accept "$PORT" -cert "$cert_file" -quiet < "$PIPE_IN" > "$PIPE_OUT" &
+        openssl_pid=$!
 
         echo "Client connected. You can start chatting. (Type 'exit' or Ctrl+D to disconnect)"
-        tput civis # Hide cursor for cleaner chat
+        tput civis # Hide cursor
 
-        # Receiver loop (runs in background to listen for messages)
-        # When the client disconnects, 'read' fails, the loop ends, and a message is printed.
-        (while read -r -u "${COPROC_SERVER[0]}" line; do
+        # Receiver: Read from PIPE_OUT and display messages from the client
+        (cat "$PIPE_OUT" | while read -r line; do
             echo -e "\r\033[KClient: $line"
             echo -n "You: "
         done; echo -e "\nClient disconnected. Waiting for new connection...") &
         receiver_pid=$!
 
-        # Sender loop (reads your input and sends it to the client)
+        # Sender: Read user input and write it to PIPE_IN
         echo -n "You: "
         while read -r -e msg; do
-            # If the receiver process has died, it means the client disconnected. Break the loop.
-            if ! ps -p $receiver_pid > /dev/null; then break; fi
             if [[ "$msg" == "exit" ]]; then break; fi
-
-            echo "$msg" >&"${COPROC_SERVER[1]}"
+            # Check if the openssl process is still alive before writing
+            if ! ps -p $openssl_pid > /dev/null; then break; fi
+            echo "$msg" > "$PIPE_IN"
             echo -n "You: "
         done
 
-        # The loop has ended, so the client is disconnected. Kill all related processes for this session.
-        kill "$coproc_pid" &>/dev/null
-        kill "$receiver_pid" &>/dev/null
+        # Client disconnected, kill the processes for this session and clean up pipes
+        kill "$openssl_pid" "$receiver_pid" &>/dev/null
+        rm -f "$PIPE_IN" "$PIPE_OUT"
         tput cnorm # Restore cursor
     done
 }
@@ -122,17 +120,20 @@ function server_mode() {
 function client_mode() {
     local server_ip=$1
     local port_arg=$2
-
     if [[ -n $port_arg && $port_arg =~ ^[0-9]+$ ]]; then
         PORT=$port_arg
     fi
 
-    echo "Connecting to $server_ip:$PORT ..."
-    coproc COPROC_CLIENT { openssl s_client -connect "$server_ip:$PORT" -quiet -crlf 2>/dev/null; }
-    coproc_pid=$COPROC_CLIENT_PID
+    # Create pipes for the client
+    mkfifo "$PIPE_IN" "$PIPE_OUT"
 
-    sleep 0.2
-    if ! ps -p $coproc_pid > /dev/null; then
+    echo "Connecting to $server_ip:$PORT ..."
+    # Start OpenSSL client in the background
+    openssl s_client -connect "$server_ip:$PORT" -quiet -crlf < "$PIPE_IN" > "$PIPE_OUT" 2>/dev/null &
+    openssl_pid=$!
+
+    sleep 0.5
+    if ! ps -p $openssl_pid > /dev/null; then
        echo "Connection failed. Is the server running at that IP/port?" >&2
        exit 1
     fi
@@ -140,23 +141,23 @@ function client_mode() {
     echo "Connected. You can start chatting. (Type 'exit' or Ctrl+D to disconnect)"
     tput civis
 
-    (while read -r -u "${COPROC_CLIENT[0]}" line; do
+    # Receiver: Read from PIPE_OUT and display messages from the server
+    (cat "$PIPE_OUT" | while read -r line; do
         echo -e "\r\033[KServer: $line"
         echo -n "You: "
     done; echo -e "\nServer disconnected.") &
     receiver_pid=$!
 
+    # Sender: Read user input and write it to PIPE_IN
     echo -n "You: "
     while read -r -e msg; do
-        if ! ps -p $receiver_pid > /dev/null; then break; fi
         if [[ "$msg" == "exit" ]]; then break; fi
-        echo "$msg" >&"${COPROC_CLIENT[1]}"
+        if ! ps -p $openssl_pid > /dev/null; then break; fi
+        echo "$msg" > "$PIPE_IN"
         echo -n "You: "
     done
     
-    # Client is exiting, clean up its processes
-    kill "$coproc_pid" &>/dev/null
-    kill "$receiver_pid" &>/dev/null
+    # Exiting, cleanup is handled by the main trap
 }
 
 # --- Argument Parsing ---
