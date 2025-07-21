@@ -10,7 +10,6 @@ DEFAULT_PORT=12345
 PORT=$DEFAULT_PORT
 
 # --- Sudo Check ---
-# Check for --nosudo flag
 nosudo_flag=false
 new_args=()
 for arg in "$@"; do
@@ -21,17 +20,14 @@ for arg in "$@"; do
     fi
 done
 
-# If --nosudo was found, update the script's arguments to remove it
 if [[ "$nosudo_flag" == true ]]; then
     set -- "${new_args[@]}"
-# If --nosudo was not found, check for root privileges
 elif [[ "$EUID" -ne 0 ]]; then
     echo "Error: This script must be run with root privileges." >&2
     echo "Please use 'sudo chattr2 ...' or add the '--nosudo' flag to run without root." >&2
     exit 1
 fi
 # --- End Sudo Check ---
-
 
 function show_help() {
     cat <<EOF
@@ -47,33 +43,26 @@ EOF
 }
 
 function generate_cert() {
-    # Generate cert in /tmp to avoid permission issues and clutter
     local cert_path="/tmp/chattr2_server.pem"
     if [[ ! -f "$cert_path" ]]; then
-        # THIS IS THE FIX: Status messages go to stderr (>&2)
         echo "Generating self-signed cert in $cert_path..." >&2
         local key_path="/tmp/chattr2_key.pem"
-        # Hide openssl command output
         openssl req -newkey rsa:2048 -nodes -keyout "$key_path" -x509 -days 365 -out "$cert_path" \
             -subj "/CN=chattr2-server" &>/dev/null
         cat "$key_path" >> "$cert_path"
         rm "$key_path"
     fi
-    # This is the ONLY thing sent to stdout, so it's all that gets captured
     echo "$cert_path"
 }
 
-# This function cleans up background processes on exit
+# This global cleanup function is called when the script is force-closed (Ctrl+C)
 function cleanup() {
-    # The >/dev/null check suppresses "kill: no such process" errors
-    if [[ -n "$COPROC_PID" ]]; then kill "$COPROC_PID" &>/dev/null; fi
+    # Kill any running background processes
+    if [[ -n "$coproc_pid" ]]; then kill "$coproc_pid" &>/dev/null; fi
     if [[ -n "$receiver_pid" ]]; then kill "$receiver_pid" &>/dev/null; fi
-    # Restore cursor visibility on exit
-    tput cnorm
-    echo -e "\nConnection closed. Exiting."
+    tput cnorm # Ensure cursor is visible
+    echo -e "\nExiting."
 }
-
-# Set a trap to call the cleanup function on script exit (e.g., Ctrl+C)
 trap cleanup EXIT
 
 function server_mode() {
@@ -83,33 +72,50 @@ function server_mode() {
     fi
 
     local cert_file
-    # This now correctly captures ONLY the path
     cert_file=$(generate_cert)
-    
-    echo "Starting chattr2 server on port $PORT..."
-    echo "Waiting for a client to connect..."
 
-    # Create a coprocess for the OpenSSL server
-    coproc COPROC_SERVER { openssl s_server -accept "$PORT" -cert "$cert_file" -quiet; }
+    # This is the main server loop. It allows the server to accept new clients after one disconnects.
+    while true; do
+        echo "Starting chattr2 server on port $PORT..."
+        echo "Waiting for a client to connect... (Ctrl+C to stop server)"
 
-    echo "Client connected. You can start chatting. (Press Ctrl+D or type 'exit' to end)"
-    # Hide cursor while typing for cleaner look
-    tput civis
+        # Start OpenSSL server in a coprocess. It will wait here until a client connects.
+        coproc COPROC_SERVER { openssl s_server -accept "$PORT" -cert "$cert_file" -quiet; }
+        coproc_pid=$COPROC_SERVER_PID
 
-    # Receiver loop (runs in the background to listen for messages)
-    (while read -r -u "${COPROC_SERVER[0]}" line; do
-        # \r\033[K clears the current terminal line before printing the message
-        echo -e "\r\033[KClient: $line"
+        # Give the process a moment to start and fail if the port is busy
+        sleep 0.2
+        if ! ps -p $coproc_pid > /dev/null; then
+           echo "Error: Server failed to start. Is port $PORT already in use?" >&2
+           exit 1
+        fi
+
+        echo "Client connected. You can start chatting. (Type 'exit' or Ctrl+D to disconnect)"
+        tput civis # Hide cursor for cleaner chat
+
+        # Receiver loop (runs in background to listen for messages)
+        # When the client disconnects, 'read' fails, the loop ends, and a message is printed.
+        (while read -r -u "${COPROC_SERVER[0]}" line; do
+            echo -e "\r\033[KClient: $line"
+            echo -n "You: "
+        done; echo -e "\nClient disconnected. Waiting for new connection...") &
+        receiver_pid=$!
+
+        # Sender loop (reads your input and sends it to the client)
         echo -n "You: "
-    done) &
-    receiver_pid=$!
+        while read -r -e msg; do
+            # If the receiver process has died, it means the client disconnected. Break the loop.
+            if ! ps -p $receiver_pid > /dev/null; then break; fi
+            if [[ "$msg" == "exit" ]]; then break; fi
 
-    # Sender loop (runs in the foreground to send messages)
-    echo -n "You: "
-    while read -r -e msg; do
-        if [[ "$msg" == "exit" ]]; then break; fi
-        echo "$msg" >&"${COPROC_SERVER[1]}"
-        echo -n "You: "
+            echo "$msg" >&"${COPROC_SERVER[1]}"
+            echo -n "You: "
+        done
+
+        # The loop has ended, so the client is disconnected. Kill all related processes for this session.
+        kill "$coproc_pid" &>/dev/null
+        kill "$receiver_pid" &>/dev/null
+        tput cnorm # Restore cursor
     done
 }
 
@@ -122,34 +128,35 @@ function client_mode() {
     fi
 
     echo "Connecting to $server_ip:$PORT ..."
-    # Create a coprocess for the OpenSSL client
     coproc COPROC_CLIENT { openssl s_client -connect "$server_ip:$PORT" -quiet -crlf 2>/dev/null; }
+    coproc_pid=$COPROC_CLIENT_PID
 
-    # Check if the coprocess started successfully (i.e., connection was made)
-    # A small sleep gives the process a moment to fail if it's going to
     sleep 0.2
-    if ! ps -p $COPROC_CLIENT_PID > /dev/null; then
+    if ! ps -p $coproc_pid > /dev/null; then
        echo "Connection failed. Is the server running at that IP/port?" >&2
        exit 1
     fi
 
-    echo "Connected. You can start chatting. (Press Ctrl+D or type 'exit' to end)"
+    echo "Connected. You can start chatting. (Type 'exit' or Ctrl+D to disconnect)"
     tput civis
 
-    # Receiver loop (runs in the background)
     (while read -r -u "${COPROC_CLIENT[0]}" line; do
         echo -e "\r\033[KServer: $line"
         echo -n "You: "
-    done) &
+    done; echo -e "\nServer disconnected.") &
     receiver_pid=$!
 
-    # Sender loop (runs in the foreground)
     echo -n "You: "
     while read -r -e msg; do
+        if ! ps -p $receiver_pid > /dev/null; then break; fi
         if [[ "$msg" == "exit" ]]; then break; fi
         echo "$msg" >&"${COPROC_CLIENT[1]}"
         echo -n "You: "
     done
+    
+    # Client is exiting, clean up its processes
+    kill "$coproc_pid" &>/dev/null
+    kill "$receiver_pid" &>/dev/null
 }
 
 # --- Argument Parsing ---
@@ -168,7 +175,7 @@ case "$1" in
     --help|-h)
         show_help
         ;;
-    ""|*) # Handle empty input and invalid commands
+    ""|*)
         if [[ -n "$1" ]]; then
              echo "Error: Invalid command '$1'." >&2
         fi
