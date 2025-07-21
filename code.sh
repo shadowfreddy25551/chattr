@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # chattr2 - simple secure chat using openssl s_server and s_client
-# This version uses robust named pipes and the -reuse flag for the server.
+# This version uses robust named pipes and file descriptors to hold pipes open.
 
 DEFAULT_PORT=12345
 PORT=$DEFAULT_PORT
@@ -58,6 +58,8 @@ PIPE_OUT="/tmp/chattr2_out_$$"
 
 # This global cleanup function is called when the script is force-closed (Ctrl+C)
 function cleanup() {
+    # Ensure file descriptor 3 is closed if it was opened
+    exec 3>&- &>/dev/null
     if [[ -n "$openssl_pid" ]]; then kill "$openssl_pid" &>/dev/null; fi
     if [[ -n "$receiver_pid" ]]; then kill "$receiver_pid" &>/dev/null; fi
     rm -f "$PIPE_IN" "$PIPE_OUT"
@@ -76,35 +78,42 @@ function server_mode() {
 
     while true; do
         mkfifo "$PIPE_IN" "$PIPE_OUT"
-
         echo "Starting chattr2 server on port $PORT..."
         echo "Waiting for a client to connect... (Ctrl+C to stop server)"
 
-        # **FIX 1**: Added the '-reuse' flag to prevent "Address already in use" errors.
-        openssl s_server -accept "$PORT" -cert "$cert_file" -quiet -reuse < "$PIPE_IN" > "$PIPE_OUT" &
+        # **FIX 1**: Removed the '-reuse' flag for better portability.
+        openssl s_server -accept "$PORT" -cert "$cert_file" -quiet < "$PIPE_IN" > "$PIPE_OUT" &
         openssl_pid=$!
 
         echo "Client connected. You can start chatting. (Type 'exit' or Ctrl+D to disconnect)"
         tput civis # Hide cursor
 
-        # **FIX 2**: Read directly from the pipe to prevent buffering issues.
+        # Receiver: Read directly from the pipe to prevent buffering issues.
         (while read -r line; do
             echo -e "\r\033[KClient: $line"
             echo -n "You: "
         done < "$PIPE_OUT"; echo -e "\nClient disconnected. Waiting for new connection...") &
         receiver_pid=$!
 
+        # **FIX 2**: Open the input pipe on file descriptor 3 to keep it open.
+        exec 3>"$PIPE_IN"
         echo -n "You: "
         while read -r -e msg; do
             if [[ "$msg" == "exit" ]]; then break; fi
             if ! ps -p $openssl_pid > /dev/null; then break; fi
-            echo "$msg" > "$PIPE_IN"
+            # Send the message through the persistent file descriptor.
+            echo "$msg" >&3
             echo -n "You: "
         done
+        # Close the file descriptor now that the loop is done.
+        exec 3>&-
 
         kill "$openssl_pid" "$receiver_pid" &>/dev/null
         rm -f "$PIPE_IN" "$PIPE_OUT"
         tput cnorm
+        
+        # **FIX 1 (cont.)**: Wait a second to allow the OS to free the port.
+        sleep 1
     done
 }
 
@@ -114,7 +123,6 @@ function client_mode() {
     if [[ -n $port_arg && $port_arg =~ ^[0-9]+$ ]]; then
         PORT=$port_arg
     fi
-
     mkfifo "$PIPE_IN" "$PIPE_OUT"
 
     echo "Connecting to $server_ip:$PORT ..."
@@ -130,43 +138,37 @@ function client_mode() {
     echo "Connected. You can start chatting. (Type 'exit' or Ctrl+D to disconnect)"
     tput civis
 
-    # **FIX 2**: Read directly from the pipe to prevent buffering issues.
+    # Receiver: Read directly from the pipe.
     (while read -r line; do
         echo -e "\r\033[KServer: $line"
         echo -n "You: "
     done < "$PIPE_OUT"; echo -e "\nServer disconnected.") &
     receiver_pid=$!
 
+    # **FIX 2**: Open the input pipe on file descriptor 3 to keep it open.
+    exec 3>"$PIPE_IN"
     echo -n "You: "
     while read -r -e msg; do
         if [[ "$msg" == "exit" ]]; then break; fi
         if ! ps -p $openssl_pid > /dev/null; then break; fi
-        echo "$msg" > "$PIPE_IN"
+        # Send the message through the persistent file descriptor.
+        echo "$msg" >&3
         echo -n "You: "
     done
+    # Close the file descriptor now that the loop is done.
+    exec 3>&-
 }
 
 # --- Argument Parsing ---
 case "$1" in
-    server)
-        server_mode "${@:2}"
-        ;;
+    server) server_mode "${@:2}"; ;;
     client)
-        if [[ -z "$2" ]]; then
-            echo "Error: Missing server IP address." >&2
-            show_help
-            exit 1
-        fi
+        if [[ -z "$2" ]]; then echo "Error: Missing server IP address." >&2; show_help; exit 1; fi
         client_mode "${@:2}"
         ;;
-    --help|-h)
-        show_help
-        ;;
+    --help|-h) show_help; ;;
     ""|*)
-        if [[ -n "$1" ]]; then
-             echo "Error: Invalid command '$1'." >&2
-        fi
-        show_help
-        exit 1
+        if [[ -n "$1" ]]; then echo "Error: Invalid command '$1'." >&2; fi
+        show_help; exit 1
         ;;
 esac
