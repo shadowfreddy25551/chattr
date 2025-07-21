@@ -2,7 +2,8 @@
 
 # chattr2 - simple secure chat using openssl s_server and s_client
 # This version adds permission-based file transfer and remote command execution,
-# with robust error handling and sequential multi-client support.
+# with robust error handling, sequential multi-client support, and local/remote
+# path shortcuts ($/ for local home, ~/ for remote home).
 
 DEFAULT_PORT=12345
 PORT=$DEFAULT_PORT
@@ -40,6 +41,10 @@ In-chat commands:
   /copy <local_file> [remote_path]   Request to send a file.
   /exec <command...>                 Request to execute a command on the remote side.
   /help                              Show this list of commands.
+
+Path Shortcuts:
+  $/   Expands to YOUR home directory (e.g., /copy $/file.txt)
+  ~/   Expands to the PEER's home directory (e.g., /exec ls ~/)
 
 The --nosudo flag allows running without root privileges.
 EOF
@@ -98,16 +103,19 @@ function start_chat() {
                     local dest_b64="${data#*:}"
                     local src_file=$(echo "$src_b64" | base64 -d)
                     local dest_file=$(echo "$dest_b64" | base64 -d)
+                    # NEW: Expand remote home path on the receiving end.
+                    dest_file="${dest_file/#\~/$HOME}"
                     echo "Incoming file request: '$src_file' to '$dest_file'. Allow? (yes/no)"
-                    echo "REQ_COPY:$src_b64:$dest_b64" > "/tmp/chattr2_req_$$"
+                    echo "REQ_COPY:$src_b64:$(echo -n "$dest_file" | base64 -w0)" > "/tmp/chattr2_req_$$"
                     ;;
                 REQ_EXEC)
                     local cmd_b64="$data"
-                    local cmd=$(echo "$cmd_b64" | base64 -d)
+                    local cmd
+                    cmd=$(echo "$cmd_b64" | base64 -d)
                     echo "Incoming exec request: '$cmd'. Allow? (yes/no)"
                     echo "REQ_EXEC:$cmd_b64" > "/tmp/chattr2_req_$$"
                     ;;
-                CMD_ERR) # NEW: Handle remote command errors
+                CMD_ERR)
                     local err_b64="$data"
                     local err_msg
                     err_msg=$(echo "$err_b64" | base64 -d)
@@ -188,14 +196,16 @@ function start_chat() {
                 echo "RESP_OK" >&3
                 if [[ "$req_prefix" == "REQ_COPY" ]]; then
                     local dest_b64="${req_data#*:}"
-                    local dest_file=$(echo "$dest_b64" | base64 -d)
+                    local dest_file
+                    dest_file=$(echo "$dest_b64" | base64 -d)
                     echo "FILE_BEGIN:$dest_file" >&3
-                elif [[ "$req_prefix" == "REQ_EXEC" ]]; then # MODIFIED: EXEC logic with error handling
+                elif [[ "$req_prefix" == "REQ_EXEC" ]]; then
                     local cmd_b64="$req_data"
                     local cmd_to_run
                     cmd_to_run=$(echo "$cmd_b64" | base64 -d)
                     echo "INFO:Executing '$cmd_to_run'..." >&3
                     
+                    # Using eval to correctly handle tilde expansion (~) on the remote side
                     local output
                     output=$(eval "$cmd_to_run" 2>&1)
                     local status=$?
@@ -222,6 +232,9 @@ function start_chat() {
             rm -f "$pending_req"
 
         elif [[ "$msg" == /* ]]; then # It's a command
+            # NEW: Expand local home directory shortcut ($/) before processing
+            msg="${msg//\$'/'/$HOME/}"
+
             read -r -a cmd_parts <<< "$msg"
             case "${cmd_parts[0]}" in
                 "/copy")
@@ -232,8 +245,8 @@ function start_chat() {
                     if [[ -z "$remote_file" ]]; then remote_file=$(basename -- "$local_file"); fi
                     
                     local src_b64 dest_b64
-                    src_b64=$(echo -n "$local_file" | base64)
-                    dest_b64=$(echo -n "$remote_file" | base64)
+                    src_b64=$(echo -n "$local_file" | base64 -w0)
+                    dest_b64=$(echo -n "$remote_file" | base64 -w0)
                     
                     echo "REQ_COPY:$src_b64:$dest_b64" > "/tmp/chattr2_req_$$_ack"
                     echo "REQ_COPY:$src_b64:$dest_b64" >&3
@@ -244,14 +257,15 @@ function start_chat() {
                     if [[ -z "$cmd_to_req" ]]; then echo "Usage: /exec <command...>"; continue; fi
                     
                     local cmd_b64
-                    cmd_b64=$(echo -n "$cmd_to_req" | base64)
+                    cmd_b64=$(echo -n "$cmd_to_req" | base64 -w0)
                     
                     echo "REQ_EXEC:$cmd_b64" > "/tmp/chattr2_req_$$_ack"
                     echo "REQ_EXEC:$cmd_b64" >&3
                     echo "Requesting to execute '$cmd_to_req' on peer. Waiting for response..."
                     ;;
                 "/help")
-                    echo "Commands: /copy <local_file> [remote_path], /exec <command...>, /help"
+                    echo "Commands: /copy, /exec, /help"
+                    echo "Path Shortcuts: \$/ (your home), ~/ (peer's home)"
                     ;;
                 *)
                     echo "Unknown command: ${cmd_parts[0]}. Type /help for a list of commands."
@@ -274,34 +288,25 @@ function server_mode() {
     local cert_file
     cert_file=$(generate_cert)
 
-    # This loop allows the server to handle clients sequentially.
-    # After a client disconnects, the loop repeats, and the server
-    # is ready to accept a new connection.
     while true; do
         mkfifo "$PIPE_IN" "$PIPE_OUT"
         echo "Starting chattr2 server on port $PORT..."
         echo "Waiting for a client to connect... (Ctrl+C to stop server)"
         
-        # The -brief flag helps ensure openssl exits cleanly after the connection closes.
         openssl s_server -brief -accept "$PORT" -cert "$cert_file" -quiet < "$PIPE_IN" > "$PIPE_OUT" &
         openssl_pid=$!
 
-        # Wait until a client is actually connected
-        # We can check if the openssl process is listening on the port.
-        # This is a simple way to wait for the "Client connected" state.
         sleep 1
 
         echo "Client connected. You can start chatting. (Type 'exit' or /help for commands)"
         start_chat "Client"
         
-        # Cleanup after a client disconnects
         kill "$openssl_pid" "$receiver_pid" &>/dev/null
         wait "$openssl_pid" 2>/dev/null
         rm -f "$PIPE_IN" "$PIPE_OUT" /tmp/chattr2_req_$$*
         tput cnorm
 
         echo "Client session ended. Server is ready for a new connection."
-        # A brief pause to ensure the OS has time to release the port fully.
         sleep 1
     done
 }
