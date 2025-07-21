@@ -85,6 +85,14 @@ function start_chat() {
     local peer_name=$1
     tput civis # Hide cursor
 
+    # NEW: Determine the correct local home directory, even when using sudo
+    local LOCAL_HOME
+    if [[ -n "$SUDO_USER" ]]; then
+        LOCAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    else
+        LOCAL_HOME=$HOME
+    fi
+
     # Receiver: Reads and processes incoming messages from the pipe.
     (
         local in_file_transfer=false
@@ -103,7 +111,7 @@ function start_chat() {
                     local dest_b64="${data#*:}"
                     local src_file=$(echo "$src_b64" | base64 -d)
                     local dest_file=$(echo "$dest_b64" | base64 -d)
-                    # NEW: Expand remote home path on the receiving end.
+                    # Expand remote home path on the receiving end. This is correct as is.
                     dest_file="${dest_file/#\~/$HOME}"
                     echo "Incoming file request: '$src_file' to '$dest_file'. Allow? (yes/no)"
                     echo "REQ_COPY:$src_b64:$(echo -n "$dest_file" | base64 -w0)" > "/tmp/chattr2_req_$$"
@@ -155,7 +163,6 @@ function start_chat() {
                     in_file_transfer=true
                     transfer_path="$data"
                     echo "Receiving file to '$transfer_path'..."
-                    # Create/truncate the file
                     > "$transfer_path"
                     ;;
                 FILE_END)
@@ -205,7 +212,6 @@ function start_chat() {
                     cmd_to_run=$(echo "$cmd_b64" | base64 -d)
                     echo "INFO:Executing '$cmd_to_run'..." >&3
                     
-                    # Using eval to correctly handle tilde expansion (~) on the remote side
                     local output
                     output=$(eval "$cmd_to_run" 2>&1)
                     local status=$?
@@ -232,8 +238,8 @@ function start_chat() {
             rm -f "$pending_req"
 
         elif [[ "$msg" == /* ]]; then # It's a command
-            # NEW: Expand local home directory shortcut ($/) before processing
-            msg="${msg//\$'/'/$HOME/}"
+            # MODIFIED: Use the intelligent LOCAL_HOME variable for expansion.
+            msg="${msg//\$'/'/$LOCAL_HOME}"
 
             read -r -a cmd_parts <<< "$msg"
             case "${cmd_parts[0]}" in
