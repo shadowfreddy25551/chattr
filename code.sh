@@ -144,7 +144,7 @@ function server_mode() {
 
         echo "Starting server on port $PORT... (Ctrl+C to stop)"
 
-        $SUDO_CMD openssl s_server -n -N -accept "$PORT" -cert "$cert_file" -quiet <"$PIPE_IN" >"$PIPE_OUT" 2>/dev/null &
+        $SUDO_CMD openssl s_server -accept "$PORT" -cert "$cert_file" -quiet <"$PIPE_IN" >"$PIPE_OUT" 2>/dev/null &
         OPENSSL_PID=$!
 
         echo "Waiting for client..."
