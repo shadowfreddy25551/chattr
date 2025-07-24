@@ -2,17 +2,16 @@
 
 DEFAULT_PORT=12345
 
-# Added 'socat' to the list of required dependencies
-for cmd in openssl ss socat; do
-    if ! command -v "$cmd" &> /dev/null; then
+# Check dependencies
+for cmd in openssl socat ss; do
+    if ! command -v "$cmd" &>/dev/null; then
         echo "Error: Core dependency '$cmd' not installed. Please install it." >&2
-        echo "e.g., sudo apt-get install socat" >&2
+        echo "e.g., sudo apt-get install socat openssl iproute2" >&2
         exit 1
     fi
 done
 
 SUDO_CMD=""
-# Logic to handle sudo and home directory remains the same
 if [[ "$EUID" -eq 0 ]]; then
     SUDO_CMD="sudo"
     if [[ -n "$SUDO_USER" ]]; then
@@ -32,8 +31,8 @@ Usage:
   chattr2 --help
 
 Commands:
-/copy <local_file> [remote_path] - send file
-/exec <command...>               - execute command on peer
+/copy <local_file> [remote_path] - send file (disabled)
+/exec <command...>               - execute command on peer (disabled)
 /help                           - show this help
 exit                           - quit chat
 
@@ -52,44 +51,45 @@ function generate_cert() {
     echo "$cert_path"
 }
 
-TMP_DIR=""
-NET_PID="" # Renamed from OPENSSL_PID
-RECEIVER_PID=""
+NET_PID=""
+READER_PID=""
 
 function cleanup() {
     tput cnorm
-    # Kill the network process (now socat) and the receiver
     [[ -n $NET_PID ]] && kill "$NET_PID" 2>/dev/null
-    [[ -n $RECEIVER_PID ]] && kill "$RECEIVER_PID" 2>/dev/null
-    [[ -n $TMP_DIR && -d $TMP_DIR ]] && rm -rf "$TMP_DIR"
+    [[ -n $READER_PID ]] && kill "$READER_PID" 2>/dev/null
     echo -e "\nExiting."
 }
 trap cleanup EXIT INT TERM
 
+# Start interactive chat over given socat fifo
+# Arguments: $1 = socat stdio file descriptor (named pipe or pty)
+# $2 = peer label for display
 function start_chat() {
-    local peer_name=$1
-    local net_pid=$2
-    # Use clearer pipe names passed from the parent function
-    local PIPE_TO_NET=$3
-    local PIPE_FROM_NET=$4
+    local socat_fd=$1
+    local peer=$2
 
     tput civis
+    echo "Type /help for commands, 'exit' to quit."
 
-    # Receiver reads messages from the network via PIPE_FROM_NET
-    (
-        while read -r line; do
-            echo -ne "\r\033[K"
+    # Read from socat_fd in background and display incoming messages
+    {
+        while IFS= read -r line <&"$socat_fd"; do
+            echo -ne "\r\033[K" # Clear input line
             case "$line" in
                 REQ_COPY:*)
                     echo "--> Incoming file request. Auto-denied."
-                    echo "RESP_NO" >&3
+                    # No response mechanism here; ignoring
                     ;;
                 REQ_EXEC:*)
                     echo "--> Incoming exec request. Auto-denied."
-                    echo "RESP_NO" >&3
                     ;;
-                RESP_OK) echo "--> Peer accepted your request." ;;
-                RESP_NO) echo "--> Peer denied your request." ;;
+                RESP_OK)
+                    echo "--> Peer accepted your request."
+                    ;;
+                RESP_NO)
+                    echo "--> Peer denied your request."
+                    ;;
                 CMD_OUT:*)
                     echo "[Remote]: ${line#CMD_OUT:}"
                     ;;
@@ -97,27 +97,30 @@ function start_chat() {
                     echo "[Info]: ${line#INFO:}"
                     ;;
                 *)
-                    echo "[$peer_name]: $line"
+                    echo "[$peer]: $line"
                     ;;
             esac
             echo -n "You: "
-        done < "$PIPE_FROM_NET"
-    ) &
-    RECEIVER_PID=$!
+        done
+    } &
+    READER_PID=$!
 
-    # Open PIPE_TO_NET on file descriptor 3. This is crucial as it keeps the pipe open.
-    exec 3>"$PIPE_TO_NET"
-
+    # Main input loop to send messages to socat
     while true; do
-        read -e -p "You: " msg || break
+        echo -n "You: "
+        if ! IFS= read -r msg; then
+            break
+        fi
 
+        # Commands handling
         if [[ "$msg" == "/live"* ]]; then
             echo "Error: /live command disabled in this version."
             continue
         fi
 
         if [[ "$msg" == /copy* || "$msg" == /exec* ]]; then
-            echo "REQ_$(echo "$msg" | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]'):$(echo -n "${msg#* }" | base64 -w0)" >&3
+            # Disabled in this version, but keeping protocol
+            echo "REQ_$(echo "$msg" | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]'):$(echo -n "${msg#* }" | base64 -w0)" >&"$socat_fd"
             echo "--> Sent request: $msg"
             continue
         fi
@@ -126,105 +129,125 @@ function start_chat() {
             break
         fi
 
-        # Send plain messages directly to the network pipe
-        echo "$msg" >&3
+        # Send plain message
+        echo "$msg" >&"$socat_fd"
     done
 
-    exec 3>&- # Close the file descriptor
-    kill "$RECEIVER_PID" 2>/dev/null
-    wait "$RECEIVER_PID" 2>/dev/null
+    kill "$READER_PID" 2>/dev/null
+    wait "$READER_PID" 2>/dev/null
     tput cnorm
 }
 
 function server_mode() {
-    local port_arg=$1
-    PORT=${port_arg:-$DEFAULT_PORT}
-
+    local port=${1:-$DEFAULT_PORT}
     local cert_file
     cert_file=$(generate_cert)
 
-    while true; do
-        TMP_DIR=$(mktemp -d "/tmp/chattr2.server.$$.XXXXXX")
-        # Clearer pipe names
-        local PIPE_FROM_NET="$TMP_DIR/from_net"
-        local PIPE_TO_NET="$TMP_DIR/to_net"
-        mkfifo "$PIPE_FROM_NET" "$PIPE_TO_NET"
+    echo "Starting server on port $port..."
 
-        echo "Starting server on port $PORT using socat... (Ctrl+C to stop)"
+    # To allow only one client at a time, run socat without fork
+    # It will listen on TCP, use SSL, and output to a pty (virtual tty)
+    TMP_DIR=$(mktemp -d "/tmp/chattr2_server.$$.XXXXXX")
+    local socat_pty="$TMP_DIR/pty"
 
-        # Use socat for a robust, bidirectional SSL server.
-        # It reads from PIPE_TO_NET and writes to PIPE_FROM_NET.
-        $SUDO_CMD socat OPENSSL-LISTEN:"$PORT",cert="$cert_file",key="$cert_file",verify=0,fork,reuseaddr \
-            < "$PIPE_TO_NET" > "$PIPE_FROM_NET" 2>/dev/null &
-        NET_PID=$!
+    # Start socat to listen on SSL port and bind its I/O to a pty
+    $SUDO_CMD socat OPENSSL-LISTEN:"$port",cert="$cert_file",key="$cert_file",verify=0,reuseaddr,bind=0 \
+        PTY,link="$socat_pty",raw,echo=0 &
 
-        echo "Waiting for client..."
-        until ss -tnp | grep -q "$NET_PID.*ESTAB"; do
-            if ! ps -p $NET_PID > /dev/null; then
-                echo "Socat server process exited unexpectedly. Is port $PORT in use?" >&2
-                break 2
-            fi
-            sleep 0.5
-        done
+    NET_PID=$!
 
-        echo "Client connected. Type /help or exit."
-
-        start_chat "Client" "$NET_PID" "$PIPE_TO_NET" "$PIPE_FROM_NET"
-
-        kill "$NET_PID" 2>/dev/null
-        wait "$NET_PID" 2>/dev/null
-        rm -rf "$TMP_DIR"
-        echo "Session ended. Waiting for new connection."
-        sleep 1
+    # Wait for pty file to exist (means client connected)
+    echo "Waiting for client to connect..."
+    while [[ ! -e "$socat_pty" ]]; do
+        if ! kill -0 "$NET_PID" 2>/dev/null; then
+            echo "Socat server process exited unexpectedly." >&2
+            rm -rf "$TMP_DIR"
+            exit 1
+        fi
+        sleep 0.2
     done
+
+    echo "Client connected. Starting chat."
+
+    # Open the pty for both reading and writing using exec and file descriptors
+    exec 3<> "$socat_pty"
+
+    start_chat 3 "Client"
+
+    # Clean up after client disconnects or exit
+    kill "$NET_PID" 2>/dev/null
+    wait "$NET_PID" 2>/dev/null
+    exec 3>&-
+    exec 3<&-
+    rm -rf "$TMP_DIR"
+
+    echo "Client disconnected. Server stopping."
 }
 
 function client_mode() {
     local server_ip=$1
-    local port_arg=$2
-    PORT=${port_arg:-$DEFAULT_PORT}
+    local port=${2:-$DEFAULT_PORT}
 
-    TMP_DIR=$(mktemp -d "/tmp/chattr2.client.$$.XXXXXX")
-    local PIPE_FROM_NET="$TMP_DIR/from_net"
-    local PIPE_TO_NET="$TMP_DIR/to_net"
-    mkfifo "$PIPE_FROM_NET" "$PIPE_TO_NET"
+    echo "Connecting to $server_ip:$port..."
 
-    echo "Connecting to $server_ip:$PORT using socat..."
+    TMP_DIR=$(mktemp -d "/tmp/chattr2_client.$$.XXXXXX")
+    local socat_pty="$TMP_DIR/pty"
 
-    # Use socat for a robust client connection.
-    # It reads from PIPE_TO_NET and writes to PIPE_FROM_NET.
-    socat OPENSSL-CONNECT:"$server_ip:$PORT",verify=0 \
-        < "$PIPE_TO_NET" > "$PIPE_FROM_NET" 2>/dev/null &
+    # Start socat to connect to server SSL port and bind to a pty
+    socat OPENSSL-CONNECT:"$server_ip:$port",verify=0 \
+        PTY,link="$socat_pty",raw,echo=0 &
+
     NET_PID=$!
 
-    # Allow time for connection to establish or fail
-    sleep 1
-    if ! ps -p "$NET_PID" > /dev/null; then
-        echo "Connection failed. Is the server running at $server_ip:$PORT?" >&2
-        rm -rf "$TMP_DIR"
-        exit 1
-    fi
+    # Wait for pty to appear (means connected)
+    local wait_count=0
+    while [[ ! -e "$socat_pty" ]]; do
+        if ! kill -0 "$NET_PID" 2>/dev/null; then
+            echo "Connection failed or server unreachable." >&2
+            rm -rf "$TMP_DIR"
+            exit 1
+        fi
+        sleep 0.2
+        ((wait_count++))
+        if ((wait_count > 50)); then
+            echo "Timeout waiting for connection." >&2
+            kill "$NET_PID" 2>/dev/null
+            rm -rf "$TMP_DIR"
+            exit 1
+        fi
+    done
 
-    echo "Connected. Type /help or exit."
-    start_chat "Server" "$NET_PID" "$PIPE_TO_NET" "$PIPE_FROM_NET"
+    echo "Connected. Starting chat."
+
+    # Open the pty for reading and writing
+    exec 3<> "$socat_pty"
+
+    start_chat 3 "Server"
 
     kill "$NET_PID" 2>/dev/null
     wait "$NET_PID" 2>/dev/null
+    exec 3>&-
+    exec 3<&-
     rm -rf "$TMP_DIR"
+
+    echo "Disconnected from server."
 }
 
-# Main script logic remains the same
 case "$1" in
-    server) server_mode "${@:2}" ;;
+    server)
+        server_mode "${2:-$DEFAULT_PORT}"
+        ;;
     client)
         if [[ -z "$2" ]]; then
             echo "Error: Missing server IP." >&2
             show_help
             exit 1
         fi
-        client_mode "${@:2}"
+        client_mode "$2" "${3:-$DEFAULT_PORT}"
         ;;
-    --help|-h) show_help ;;
+    --help|-h)
+        show_help
+        ;;
     *)
         echo "Error: Invalid command '$1'."
         show_help
